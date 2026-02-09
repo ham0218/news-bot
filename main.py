@@ -45,20 +45,18 @@ def delete_old_news():
         print(f"   - 🗑️ 삭제됨 (ID: {page_id})")
 
 # ==========================================
-# 3. 본문 추출 (인베스팅닷컴 차단 대비)
+# 3. 본문 추출
 # ==========================================
 def get_full_article(url, summary_fallback=""):
     try:
         config = Config()
-        # 봇 차단 방지를 위한 브라우저 위장
-        config.browser_user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.75 Safari/537.36'
+        config.browser_user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
         config.request_timeout = 10
         
         article = Article(url, language='ko', config=config)
         article.download()
         article.parse()
         
-        # 본문이 너무 짧으면(보안 차단됨) RSS 요약본으로 대체
         if len(article.text) < 50:
             if summary_fallback:
                 return f"⚠️ [보안 차단] 기사 본문 스크랩이 막혀 요약본으로 대체합니다.\n\n{summary_fallback}"
@@ -71,20 +69,25 @@ def get_full_article(url, summary_fallback=""):
         return "본문 추출 실패"
 
 # ==========================================
-# 4. 노션 업로드 (출처 표시 기능)
+# 4. 노션 업로드 (아이콘 설정 기능 추가됨!)
 # ==========================================
-def create_page(category, source_name, title, link, date, content):
+def create_page(category, source_name, title, link, date, content, icon_emoji):
     url = "https://api.notion.com/v1/pages"
     
-    # 제목 앞머리에 [출처] 붙이기
     final_title = f"[{source_name}] {title}"
 
-    # 내용 길면 자르기
     if len(content) > 1800:
         content = content[:1800] + "\n...(중략)... (전체 내용은 아래 링크 확인)"
 
     data = {
         "parent": {"database_id": DATABASE_ID},
+        # -----------------------------------------------------
+        # [NEW] 여기에 아이콘을 설정하는 코드가 추가되었습니다.
+        # -----------------------------------------------------
+        "icon": {
+            "type": "emoji",
+            "emoji": icon_emoji
+        },
         "properties": {
             "이름": {"title": [{"text": {"content": final_title}}]},
             "URL": {"url": link},
@@ -120,42 +123,47 @@ def create_page(category, source_name, title, link, date, content):
     requests.post(url, headers=headers, json=data)
 
 # ==========================================
-# 5. 메인 실행 (5대장 뉴스 소스)
+# 5. 메인 실행
 # ==========================================
 delete_old_news()
 
-print("\n📰 [뉴스 수집 시작] 5개 언론사에서 핵심 기사 4개씩 가져옵니다...")
+print("\n📰 [뉴스 수집 시작] 아이콘까지 예쁘게 붙여서 가져옵니다...")
 
 targets = [
-    # --- 1. 미국 주식 (한경글로벌 + 인베스팅) ---
+    # --- 미국 주식 (성조기) ---
     {
         "category": "미국주식",
         "source": "한경글로벌",
-        "rss": "https://rss.hankyung.com/feed/international"
+        "rss": "https://rss.hankyung.com/feed/international",
+        "icon": "🇺🇸" 
     },
     {
         "category": "미국주식",
         "source": "인베스팅",
-        "rss": "https://kr.investing.com/rss/news_285.rss" # 인베스팅 주식시장 뉴스
+        "rss": "https://kr.investing.com/rss/news_285.rss",
+        "icon": "🇺🇸"
     },
     
-    # --- 2. 국내 주식 (한국경제 + 매일경제) ---
+    # --- 국내 주식 (태극기) ---
     {
         "category": "국내주식",
         "source": "한국경제",
-        "rss": "https://rss.hankyung.com/feed/stock"
+        "rss": "https://rss.hankyung.com/feed/stock",
+        "icon": "🇰🇷"
     },
     {
         "category": "국내주식",
         "source": "매일경제",
-        "rss": "https://www.mk.co.kr/rss/50200011/"
+        "rss": "https://www.mk.co.kr/rss/50200011/",
+        "icon": "🇰🇷"
     },
 
-    # --- 3. 코인 (코인데스크/토큰포스트) ---
+    # --- 코인 (동전) ---
     {
         "category": "코인",
-        "source": "코인데스크", # 실제 데이터는 안정적인 토큰포스트 RSS 사용
-        "rss": "https://www.tokenpost.kr/rss"
+        "source": "코인데스크",
+        "rss": "https://www.tokenpost.kr/rss",
+        "icon": "🪙"
     }
 ]
 
@@ -163,39 +171,36 @@ for target in targets:
     category = target["category"]
     source = target["source"]
     rss_url = target["rss"]
+    icon = target["icon"] # 아이콘 정보 가져오기
     
-    print(f"\n🔎 [{category} - {source}] 뉴스 4개 가져오는 중...")
+    print(f"\n🔎 [{category} - {source}] 뉴스 가져오는 중...")
     
     try:
         feed = feedparser.parse(rss_url)
-        
         count = 0
-        MAX_ARTICLES = 4 # 언론사별로 가져올 기사 개수 (원하시면 숫자를 5나 6으로 늘려도 됩니다)
+        MAX_ARTICLES = 4 
         
         for entry in feed.entries:
             if count >= MAX_ARTICLES:
                 break
                 
-            # 날짜 처리
             if hasattr(entry, 'published_parsed'):
                 dt = datetime(*entry.published_parsed[:6]).isoformat()
             else:
                 dt = datetime.now().isoformat()
             
-            # 인베스팅닷컴 등 대비용 요약본 준비
-            summary_fallback = entry.get('description', '')
-            summary_fallback = summary_fallback.replace('<p>', '').replace('</p>', '').replace('<br>', '\n')
+            summary_fallback = entry.get('description', '').replace('<p>', '').replace('</p>', '').replace('<br>', '\n')
 
-            # 본문 추출
             full_text = get_full_article(entry.link, summary_fallback)
             
-            # 노션 업로드
-            create_page(category, source, entry.title, entry.link, dt, full_text)
-            print(f"   ✅ 저장 완료: [{source}] {entry.title}")
+            # create_page 함수에 icon 정보도 같이 넘겨줍니다!
+            create_page(category, source, entry.title, entry.link, dt, full_text, icon)
+            
+            print(f"   ✅ 저장 완료: {icon} [{source}] {entry.title}")
             
             count += 1
 
     except Exception as e:
-        print(f"   ❌ {source} 처리 중 에러: {e}")
+        print(f"   ❌ {source} 에러: {e}")
 
-print("\n🎉 모든 뉴스 배달 완료!")
+print("\n🎉 모든 뉴스 배달 완료! 노션을 확인해보세요.")
