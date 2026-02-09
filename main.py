@@ -1,9 +1,12 @@
 import requests
 import feedparser
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
+from newspaper import Article, Config
 
-# 깃허브 시크릿에서 키 가져오기
+# ==========================================
+# 1. 기본 설정
+# ==========================================
 NOTION_TOKEN = os.environ['NOTION_TOKEN']
 DATABASE_ID = os.environ['DATABASE_ID']
 
@@ -13,8 +16,71 @@ headers = {
     "Notion-Version": "2022-06-28"
 }
 
-def create_page(category, title, link, date):
+# ==========================================
+# 2. [청소부] 3일 지난 뉴스 자동 삭제
+# ==========================================
+def delete_old_news():
+    print("🧹 [청소 시작] 3일 지난 뉴스를 정리합니다...")
+    
+    # 오늘 날짜 기준 3일 전 계산
+    three_days_ago = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+    
+    # 노션에 쿼리: 날짜가 3일 전(포함)보다 과거인 것들
+    query_url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
+    payload = {
+        "filter": {
+            "property": "날짜",
+            "date": {
+                "on_or_before": three_days_ago
+            }
+        }
+    }
+    
+    response = requests.post(query_url, headers=headers, json=payload)
+    results = response.json().get("results", [])
+
+    if not results:
+        print("   - 삭제할 오래된 뉴스가 없습니다. (깨끗함)")
+        return
+
+    for page in results:
+        page_id = page["id"]
+        # 휴지통으로 보내기 (Archive)
+        delete_url = f"https://api.notion.com/v1/pages/{page_id}"
+        requests.patch(delete_url, headers=headers, json={"archived": True})
+        print(f"   - 🗑️ 삭제 완료 (ID: {page_id})")
+
+# ==========================================
+# 3. [본문 추출] 신문 기사 내용 긁어오기
+# ==========================================
+def get_full_article(url):
+    try:
+        # 봇 차단 방지용 설정
+        config = Config()
+        config.browser_user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.75 Safari/537.36'
+        config.request_timeout = 10
+
+        article = Article(url, language='ko', config=config)
+        article.download()
+        article.parse()
+        
+        # 본문이 너무 짧으면(로그인 필요 등) 에러 메시지
+        if len(article.text) < 50:
+            return "본문 보안 설정으로 내용을 가져오지 못했습니다. 원문 링크를 확인해주세요."
+        return article.text
+    except Exception as e:
+        return "본문 추출 중 에러가 발생했습니다."
+
+# ==========================================
+# 4. [업로드] 노션에 예쁘게 글쓰기
+# ==========================================
+def create_page(category, title, link, date, content):
     url = "https://api.notion.com/v1/pages"
+    
+    # 노션 글자수 제한(2000자) 고려해서 자르기
+    if len(content) > 1800:
+        content = content[:1800] + "\n\n...(중략)... (전체 내용은 아래 링크 확인)"
+
     data = {
         "parent": {"database_id": DATABASE_ID},
         "properties": {
@@ -22,32 +88,93 @@ def create_page(category, title, link, date):
             "URL": {"url": link},
             "날짜": {"date": {"start": date}},
             "카테고리": {"select": {"name": category}}
-        }
+        },
+        "children": [
+            {
+                "object": "block",
+                "type": "callout",
+                "callout": {
+                    "rich_text": [{"text": {"content": "자동 추출된 기사 본문입니다."}}],
+                    "icon": {"emoji": "📰"},
+                    "color": "gray_background"
+                }
+            },
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [{"text": {"content": content}}]
+                }
+            },
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [{"text": {"content": "👉 원문 전체 보러가기: " + link, "link": {"url": link}}}]
+                }
+            }
+        ]
     }
-    res = requests.post(url, headers=headers, json=data)
-    if res.status_code != 200:
-        print(f"에러 발생: {res.status_code} {res.text}")
+    
+    requests.post(url, headers=headers, json=data)
 
-# 뉴스 및 캘린더 RSS 주소
-rss_list = {
-    "국내주식": "https://news.google.com/rss/search?q=국내주식+OR+코스피&hl=ko&gl=KR&ceid=KR:ko",
-    "미국주식": "https://news.google.com/rss/search?q=미국주식+OR+나스닥&hl=ko&gl=KR&ceid=KR:ko",
-    "코인": "https://news.google.com/rss/search?q=비트코인+OR+암호화폐&hl=ko&gl=KR&ceid=KR:ko",
-    "경제캘린더": "https://www.tokenpost.kr/rss/calendar"
-}
+# ==========================================
+# 5. [메인] 뉴스 수집 시작
+# ==========================================
+# 먼저 청소부터 하고 시작
+delete_old_news()
 
-print("--- 뉴스 수집 시작 ---")
-for category, rss in rss_list.items():
+print("\n📰 [뉴스 수집 시작] 주요 언론사의 핵심 기사 4개씩 가져옵니다...")
+
+# 퀄리티 검증된 RSS 주소 목록
+targets = [
+    {
+        "category": "미국주식",
+        "rss": "https://rss.hankyung.com/feed/international" # 한국경제 국제면
+    },
+    {
+        "category": "국내주식",
+        "rss": "https://www.mk.co.kr/rss/50200011/" # 매일경제 증권면
+    },
+    {
+        "category": "코인",
+        "rss": "https://www.tokenpost.kr/rss" # 토큰포스트
+    }
+]
+
+for target in targets:
+    category = target["category"]
+    rss_url = target["rss"]
+    
+    print(f"\n🔎 [{category}] 뉴스 가져오는 중...")
+    
     try:
-        feed = feedparser.parse(rss)
-        for entry in feed.entries[:3]: # 각 주제별 최신 3개만
-            try:
+        feed = feedparser.parse(rss_url)
+        
+        # 카테고리 당 최신 기사 4개만 가져옴
+        count = 0
+        MAX_ARTICLES = 4 
+        
+        for entry in feed.entries:
+            if count >= MAX_ARTICLES:
+                break
+                
+            # 날짜 처리
+            if hasattr(entry, 'published_parsed'):
                 dt = datetime(*entry.published_parsed[:6]).isoformat()
-            except:
+            else:
                 dt = datetime.now().isoformat()
+            
+            # 본문 추출
+            full_text = get_full_article(entry.link)
+            
+            # 노션 저장
+            create_page(category, entry.title, entry.link, dt, full_text)
+            print(f"   ✅ 저장: {entry.title}")
+            
+            count += 1
 
-            create_page(category, entry.title, entry.link, dt)
-            print(f"[{category}] 저장: {entry.title}")
     except Exception as e:
-        print(f"[{category}] 처리 중 오류: {e}")
-print("--- 수집 완료 ---")
+        print(f"   ❌ 에러 발생: {e}")
+
+print("\n🎉 모든 뉴스 배달 완료!")
